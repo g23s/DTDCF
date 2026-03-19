@@ -1,6 +1,6 @@
 # DT-DCF: Dynamic Temporal-Domain Causal Fusion Network
 
-This repository provides a **partial implementation** of DT-DCF for multimodal sentiment analysis.
+This repository provides the implementation of **DT-DCF** for multimodal sentiment analysis.
 
 ------
 
@@ -54,8 +54,6 @@ This repository contains core components of the DT-DCF model.
 python main.py
 ```
 
-This code is intended for **research reference only** and may require additional preprocessing or configuration to fully reproduce results.
-
 ------
 
 ## Project Structure
@@ -64,18 +62,7 @@ This code is intended for **research reference only** and may require additional
 .
 ├── main.py
 ├── solver.py
-├── model.py
 ├── MSA.py
 └── utils/
 ```
-
-------
-
-## Important Notes
-
-- This repository provides **partial implementation** for research and review purposes.
-- Some components (e.g., data preprocessing, full training pipeline, and certain implementation details) are **not publicly released**.
-- Pretrained model weights are not included.
-
-------
 
