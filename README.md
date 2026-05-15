@@ -1,68 +1,53 @@
-# DT-DCF: Dynamic Temporal-Domain Causal Fusion Network
+# DT-DCF: Dynamic Temporal Modeling and Distribution-Calibrated Fusion for Multimodal Sentiment Analysis
 
-This repository provides the implementation of **DT-DCF** for multimodal sentiment analysis.
+This repository provides an anonymized implementation of the paper **“DT-DCF: Dynamic Temporal Modeling and Distribution-Calibrated Fusion for Multimodal Sentiment Analysis”**.
 
-------
+DT-DCF is a confidence-modulated fusion framework for multimodal sentiment analysis. It estimates modality confidence from temporal granularity selection distributions and Gaussian representation uncertainty, and uses the estimated confidence to dynamically modulate cross-modal fusion and conditional representation alignment.
 
-## Highlights
+The model first performs adaptive temporal modeling on audio and visual sequences to capture sample-specific emotional dynamics. Then, textual, acoustic, and visual representations are modeled with distributional uncertainty to estimate modality confidence, which is used to modulate cross-modal fusion. Finally, the fused representation is aligned with unimodal representations through a confidence-guided conditional alignment process.
 
-A unified framework that integrates dynamic temporal modeling and causal-aware cross-modal fusion to improve robustness against spurious correlations in multimodal sentiment analysis.
+Experiments are conducted on the CMU-MOSI, CMU-MOSEI, and CH-SIMS datasets. 
 
-------
+---
 
-## Experimental Environment
+## Requirements
 
-The experiments are conducted under the following settings:
+The recommended environment is as follows:
 
-- Framework: PyTorch
-- GPU: NVIDIA A40 (single GPU)
-- Python: 3.8
-- Optimizer: AdamW
-- Training Strategy:
-  - Module-wise learning rates
-  - Learning rate warmup
-  - Weight decay
+```bash
+python >= 3.8
+pytorch >= 1.12
+cuda >= 11.3
+```
 
-### Modalities
+The main dependencies include:
 
-- **Text**: BERT-base encoder (768-dim representations)
-- **Audio**: COVAREP features + MFCC (≈113-dim)
-- **Vision**: OpenFace features (≈35-dim)
+```text
+numpy
+scipy
+scikit-learn
+pandas
+tqdm
+torch
+transformers
+```
 
-------
+Install the dependencies with:
 
-## Datasets
+```bash
+pip install -r requirements.txt
+```
 
-The experiments involve the following datasets:
+---
+
+## Dataset preparation
+
+This project supports the following multimodal sentiment analysis datasets:
 
 - CMU-MOSI
 - CMU-MOSEI
 - CH-SIMS
 
-**Note:**
+Please download and preprocess the corresponding datasets, and place the processed data files under the `data/` directory.
 
-- Due to dataset license and preprocessing dependencies, **data loading scripts are not included**.
-- Users are expected to prepare datasets following standard protocols.
-
-------
-
-## Usage
-
-This repository contains core components of the DT-DCF model.
-
-```bash
-python main.py
-```
-
-------
-
-## Project Structure
-
-```text
-.
-├── main.py
-├── solver.py
-├── MSA.py
-└── utils/
-```
-
+Due to the original data release licenses and usage agreements, this repository does not provide the raw dataset files. Please obtain the datasets according to the official requirements of each benchmark.
