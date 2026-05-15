@@ -5,7 +5,17 @@ import time
 from utils.eval_metrics import *
 from utils.tools import *
 from MSA import MSA
-from transformers import get_linear_schedule_with_warmup
+try:
+    from transformers import get_linear_schedule_with_warmup
+except ImportError:
+    from transformers import WarmupLinearSchedule
+
+    def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+        return WarmupLinearSchedule(
+            optimizer,
+            warmup_steps=num_warmup_steps,
+            t_total=num_training_steps
+        )
 from src.utils.Sinkhorn import CustomMultiLossLayer
 # from torch.utils.tensorboard import SummaryWriter
 import os
@@ -14,25 +24,39 @@ import torch.nn.functional as F
 
 def irm_loss(fused, unimodal):
     return torch.mean((fused - unimodal)**2)
+#用 MSE 做稳健性约束
+def robustness_loss(factual_repr, perturbed_repr):
+    return F.mse_loss(factual_repr, perturbed_repr)
 
-# ================================================================
-# 因果敏感性驱动反事实损失函数 (sensitivity 模式)
-# ================================================================
-def causal_sensitivity_cf_loss(factual_attn, counter_attn, eps=1e-8):
-    """
-    因果敏感性驱动反事实损失（sensitivity 模式）
-    factual_attn: [B, D] factual 分支输出
-    counter_attn: [B, D] counterfactual 分支输出
-    """
-    with torch.no_grad():
-        # (1) 计算注意力差距（反事实扰动强度）
-        gap = torch.abs(factual_attn - counter_attn)
-        # (2) 归一化得到重要性权重
-        importance = gap / (gap.sum(dim=-1, keepdim=True) + eps)
+def format_dtm_debug(model):
+    debug = getattr(model, "dtm_debug", None)
+    if not debug or debug.get("g_a") is None or debug.get("g_v") is None:
+        return ""
 
-    # (3) 计算加权的 -log(factual_attn)
-    loss = -(importance * torch.log_softmax(factual_attn, dim=-1)).mean()
-    return loss
+    tau_a = debug["tau_a"].mean().item()
+    tau_v = debug["tau_v"].mean().item()
+    g_a = debug["g_a"].mean(dim=0).detach().cpu().tolist()
+    g_v = debug["g_v"].mean(dim=0).detach().cpu().tolist()
+    g_a_str = ",".join(f"{x:.2f}" for x in g_a)
+    g_v_str = ",".join(f"{x:.2f}" for x in g_v)
+    return f" | tau_a {tau_a:.3f} | tau_v {tau_v:.3f} | g_a [{g_a_str}] | g_v [{g_v_str}]"
+
+def set_dtm_gumbel_temperature(model, epoch, total_epochs, start_tau, min_tau):
+    if total_epochs <= 1:
+        tau = min_tau
+    else:
+        progress = (epoch - 1) / (total_epochs - 1)
+        tau = start_tau + (min_tau - start_tau) * progress
+    tau = max(min_tau, tau)
+    for module in model.modules():
+        if hasattr(module, "gumbel_temperature"):
+            module.gumbel_temperature = tau
+    return tau
+
+def set_dtm_hard_selection(model, enabled):
+    for module in model.modules():
+        if hasattr(module, "dtm_hard_selection"):
+            module.dtm_hard_selection = enabled
 
 class Solver(object):
     def __init__(self, hyp_params, train_loader, dev_loader, test_loader, is_train=True, model=None,
@@ -49,12 +73,34 @@ class Solver(object):
         # initialize the model
         if model is None:
             self.model = model = MSA(hp)  # 本文的模型在这里
+            # =========================
+            # 打印模型参数量（新增）
+            # =========================
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+            print("========== Model Parameters ==========")
+            print(f"Total parameters: {total_params}")
+            print(f"Trainable parameters: {trainable_params}")
+            print(f"Total parameters (Million): {total_params / 1e6:.2f} M")
+            print("======================================")
+            # =========================
+            # 单独统计 BERT 参数量
+            # =========================
+            bert_params = sum(p.numel() for name, p in self.model.named_parameters() if 'bert' in name.lower())
+
+            print(f"BERT parameters: {bert_params}")
+            print(f"BERT parameters (Million): {bert_params / 1e6:.2f} M")
+
+
+
+
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
-            model = model.cuda()
         else:
             self.device = torch.device("cpu")
+        model = model.to(self.device)
             # ✅ 在这里加（最正确位置） 计算 参数量（Parameter Count）
         #total_params = sum(p.numel() for p in model.parameters())
         #trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -130,6 +176,9 @@ class Solver(object):
     def train_and_eval(self):
         model = self.model
         optimizer = self.optimizer
+
+        SAVE_TSNE_EPOCHS = [1, 5, 10]
+
         print("Learning Rates for Each Parameter Group:")
         print(f"BERT learning rate: {self.hp.lr_bert}")
         print(f"Main learning rate: {self.hp.lr_main}")
@@ -160,88 +209,43 @@ class Solver(object):
             for i_batch, batch_data in enumerate(self.train_loader):
                 visual, vlens, audio, alens, r_labels,c_labels,l, bert_sent, bert_sent_mask, ids = batch_data
                 model.zero_grad()
-                with torch.cuda.device(0):
-                    visual, audio, r_labels,c_labels, l, bert_sent, bert_sent_mask = \
-                        visual.cuda(), audio.cuda(), r_labels.cuda(), c_labels.cuda(),l.cuda(), bert_sent.cuda(), \
-                            bert_sent_mask.cuda()
+                visual = visual.to(self.device)
+                audio = audio.to(self.device)
+                r_labels = r_labels.to(self.device)
+                c_labels = c_labels.to(self.device)
+                l = l.to(self.device)
+                bert_sent = bert_sent.to(self.device)
+                bert_sent_mask = bert_sent_mask.to(self.device)
                 batch_size = r_labels.size(0)
                 # 前向返回 recon_loss 和 dis_loss 是张量，不要和累计器混淆
-                r_preds, r_preds_F, recon_loss, dis_loss, factual_text, counter_text = model(
-                    visual, audio, v_size, a_size, bert_sent, bert_sent_mask
-                )
-                #r_preds, r_preds_F, recon_loss,dis_loss, factual_text, counter_text = model(visual, audio, v_size, a_size, bert_sent, bert_sent_mask)
-                # KL 散度损失：L_cf = KL(factual || counterfactual)
-                # log_p = torch.log_softmax(factual_text, dim=-1)  # factual 分支
-                # q = torch.softmax(counter_text.detach(), dim=-1)  # counterfactual 分支
-                # #L_cf = torch.nn.functional.kl_div(log_p, q, reduction="batchmean")
-                # L_cf = F.kl_div(log_p, q, reduction="batchmean")
+                #r_preds, r_preds_F, recon_loss, dis_loss, factual_text, counter_text = model(visual, audio, v_size, a_size, bert_sent, bert_sent_mask)
 
-#下面这段改cf损失逻辑
-                # # ===================== 因果对比损失 ===================== #
-                # # factual 分支（anchor）
-                # log_p = torch.log_softmax(factual_text, dim=-1)
-                # p = torch.softmax(factual_text, dim=-1)
-                # # counterfactual 分支（负样本）
-                # log_q = torch.log_softmax(counter_text, dim=-1)
-                # q = torch.softmax(counter_text, dim=-1)
-                #
-                # # 1. 对称 KL 散度 (保证双向约束)
-                # kl_fq = F.kl_div(log_p, q, reduction="batchmean")  # KL(P||Q)
-                # kl_qf = F.kl_div(log_q, p, reduction="batchmean")  # KL(Q||P)
-                # L_cf_kl = (kl_fq + kl_qf) / 2.0
-                #
-                # # 2. InfoNCE / SupCon 损失 (factual = anchor, counterfactual = 负样本)
-                # temperature = 0.07
-                # f_norm = F.normalize(factual_text, dim=-1)
-                # cf_norm = F.normalize(counter_text, dim=-1)
-                #
-                # # 正样本：factual 与同 batch 的标签一致样本
-                # # 负样本：counterfactual + 其他类 factual
-                # labels = r_labels.view(-1, 1)  # batch 标签
-                # mask = torch.eq(labels, labels.T).float().to(self.device)  # 正样本掩码
-                #
-                # sim_matrix = torch.matmul(f_norm, f_norm.T) / temperature  # factual-factual 相似度
-                # sim_matrix_cf = torch.matmul(f_norm, cf_norm.T) / temperature  # factual-counter 相似度
-                #
-                # # InfoNCE: anchor factual，对比所有 factual+cf
-                # logits = torch.cat([sim_matrix, sim_matrix_cf], dim=1)  # 拼接正负样本
-                # supcon_loss = -torch.log(
-                #     torch.sum(torch.exp(sim_matrix) * mask, dim=1) /
-                #     torch.sum(torch.exp(logits), dim=1)
-                # ).mean()
-                #
-                # # 3. 互信息最大化 (避免 collapse)
-                # # 使用 Jensen-Shannon MI estimator (近似 mutual information)
-                # mi_loss = -torch.mean(torch.sum(p * torch.log(q + 1e-6), dim=-1))
-                #
-                # # 总的因果对比损失
-                # L_cf = L_cf_kl + self.hp.lambda_supcon * supcon_loss + self.hp.lambda_mi * mi_loss
-# ===================== 因果敏感性反事实损失 ===================== #
-                # factual_attention = factual_text
-                # counter_attention = counter_text
-                L_cf = causal_sensitivity_cf_loss(factual_text, counter_text.detach())
+                model_out = model(visual, audio, v_size, a_size, bert_sent, bert_sent_mask)
+                if len(model_out) == 8:
+                    r_preds, r_preds_F, recon_loss, dis_loss, factual_text, counter_text, F_feat, irm_loss = model_out
+                else:
+                    r_preds, r_preds_F, recon_loss, dis_loss, factual_text, counter_text, F_feat = model_out
+                    irm_loss = torch.tensor(0.0, device=self.device)
 
+                L_rob = robustness_loss(factual_text, counter_text.detach())
+
+
+                #L_rob = torch.tensor(0.0, device=self.device)
                 h_loss = nn.L1Loss()
 
                 single_loss = h_loss(r_preds, r_labels)
                 fusion_loss = h_loss(r_preds_F, r_labels)
 
-                #如果是分类任务，使用交叉熵损失
-                # criterion_cls = nn.CrossEntropyLoss()
-                # classification_loss = criterion_cls(c_preds, c_labels)
-                # 使用自定义损失层计算总损失
-
-                #loss = custom_loss_layer([single_loss, fusion_loss, rec_loss, dis_loss])下面加了lcf
-                # loss_core = custom_loss_layer([single_loss, fusion_loss, recon_loss, dis_loss])
-                # loss = loss_core + self.hp.lambda_cf * L_cf
-                # ✅ 使用固定加权和（超参数需在 config.py 里设置）
+                #  使用固定加权和（超参数需在 config.py 里设置）
                 loss = (
                         self.hp.lambda_single * single_loss +
                         self.hp.lambda_fusion * fusion_loss +
                         self.hp.lambda_recon * recon_loss +
                         self.hp.lambda_dis * dis_loss +
-                        self.hp.lambda_cf * L_cf
+                        self.hp.lambda_rob * L_rob +
+                        self.hp.lambda_irm * irm_loss
                 )
+                #+self.hp.lambda_rob * L_rob
 
                 # 反传更新
                 optimizer.zero_grad()
@@ -291,71 +295,99 @@ class Solver(object):
                     avg_loss2 = fusion_loss_sum / proc_size
                     avg_loss3 = recon_loss_sum / proc_size
                     avg_loss4 = dis_loss_sum / proc_size
-                    # avg_loss1 = s_loss / proc_size
-                    # avg_loss2 = fusion_loss / proc_size
-                    # avg_loss3 = recon_loss/ proc_size
-                    # avg_loss4 = dis_loss/ proc_size
+
                     elapsed_time = time.time() - start_time
-                    # print(
-                    #     'Epoch {:2d} | Batch {:3d}/{:3d} | Time/Batch(ms) {:5.2f} | S_loss  {:5.4f} | F_loss {:5.4f} | REC {:5.4f}| DIS {:5.4f}'.
-                    #     format(epoch, i_batch, num_batches, elapsed_time * 1000 / self.hp.log_interval, avg_loss1,
-                    #            avg_loss2,avg_loss3,avg_loss4))
+
                     print(
                         'Batch {:3d}/{:3d} | Time/Batch(ms) {:5.2f} '
-                        '| S_loss {:5.4f} | F_loss {:5.4f} | REC {:5.4f} | DIS {:5.4f} | CF {:5.4f}'.
+                        '| S_loss {:5.4f} | F_loss {:5.4f} | REC {:5.4f} | DIS {:5.4f} | ROB {:5.4f} | IRM {:5.4f}{}'.
                         format(i_batch, num_batches, elapsed_time * 1000 / self.hp.log_interval,
-                               avg_loss1, avg_loss2, avg_loss3, avg_loss4, L_cf.item())
+                               avg_loss1, avg_loss2, avg_loss3, avg_loss4, L_rob.item(), irm_loss.item(), format_dtm_debug(model))
                     )
 
-                    # print(
-                    #     'Epoch {:2d} | Batch {:3d}/{:3d} | Time/Batch(ms) {:5.2f} '
-                    #     '| S_loss {:5.4f} | F_loss {:5.4f} | REC {:5.4f} | DIS {:5.4f} | CF {:5.4f}'.
-                    #     format(epoch, i_batch, num_batches,
-                    #            elapsed_time * 1000 / self.hp.log_interval,
-                    #            avg_loss1, avg_loss2, avg_loss3, avg_loss4,
-                    #            L_cf.item())
-                    # )# ✅ 清零累计器，不要清张量
+
                     single_loss_sum, fusion_loss_sum, recon_loss_sum, dis_loss_sum, proc_size = 0, 0, 0, 0, 0
-                    #s_loss, fusion_loss,recon_loss,dis_loss,proc_size = 0, 0, 0,0,0
+
                     start_time = time.time()
             return epoch_loss_sum / self.hp.n_train
 
             #return epoch_loss / self.hp.n_train
 
-        def evaluate(model, test=False):
+        def evaluate(model, test=False, epoch=None):
+
+        #def evaluate(model, test=False):
             model.eval()
             loader = self.test_loader if test else self.dev_loader
 
+            # =========================
+            # Inference efficiency metrics
+            # =========================
+            measure_efficiency = test and (epoch == self.hp.num_epochs)
+
+            total_infer_time = 0.0
+            total_infer_samples = 0
+            total_infer_batches = 0
+
+            if measure_efficiency and torch.cuda.is_available():
+                 torch.cuda.empty_cache()
+                 torch.cuda.reset_peak_memory_stats()
+                 torch.cuda.synchronize()
+
             # 计算推理时间 在函数开头加变量 添加2行
-            total_infer_time = 0
-            num_batches = 0
+           # total_infer_time = 0
+           # num_batches = 0
 
             total_loss = 0.0
 
             results = []
             truths = []
+            feat_list = []
 
             with torch.no_grad():
                 for i_batch, batch_data in enumerate(loader):
                     visual, vlens, audio, alens, r_labels,c_labels,lengths, bert_sent, bert_sent_mask, ids = batch_data
 
-                    with torch.cuda.device(0):
-                        audio, visual, r_labels,c_labels = audio.cuda(), visual.cuda(), r_labels.cuda(), c_labels.cuda()
-                        # print(visual.size())
-                        lengths = lengths.cuda()
-                        bert_sent, bert_sent_mask = bert_sent.cuda(), bert_sent_mask.cuda()
+                    audio = audio.to(self.device)
+                    visual = visual.to(self.device)
+                    r_labels = r_labels.to(self.device)
+                    c_labels = c_labels.to(self.device)
+                    # print(visual.size())
+                    lengths = lengths.to(self.device)
+                    bert_sent = bert_sent.to(self.device)
+                    bert_sent_mask = bert_sent_mask.to(self.device)
                     batch_size = lengths.size(0)  # bert_sent in size (bs, seq_len, emb_size)
 #添加2行
-                    torch.cuda.synchronize()
-                    start = time.time()
+                  #  torch.cuda.synchronize()
+                  #  start = time.time()
 
-                    r_preds,r_preds_F,recon_loss,dis_loss, _, _  = model(visual, audio, vlens, alens, bert_sent, bert_sent_mask)
+                    #r_preds,r_preds_F,recon_loss,dis_loss, _, _  = model(visual, audio, vlens, alens, bert_sent, bert_sent_mask)
+
+
+                    #r_preds, r_preds_F, recon_loss, dis_loss, _, _, F_feat = model(visual, audio, vlens, alens, bert_sent, bert_sent_mask)
+
+                    # =========================
+                    # Measure pure inference time
+                    # =========================
+                    if measure_efficiency and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        infer_start = time.time()
+
+                    model_out = model(visual, audio, vlens, alens, bert_sent, bert_sent_mask)
+                    r_preds, r_preds_F, recon_loss, dis_loss, _, _, F_feat = model_out[:7]
+
+                    if measure_efficiency and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        infer_end = time.time()
+
+                        total_infer_time += (infer_end - infer_start)
+                        total_infer_samples += batch_size
+                        total_infer_batches += 1
 
 #添加4行
-                    torch.cuda.synchronize()
-                    end = time.time()
-                    total_infer_time += (end - start)
-                    num_batches += 1
+                  #  torch.cuda.synchronize()
+                  #  end = time.time()
+                  #  total_infer_time += (end - start)
+                   # num_batches += 1
 
 
 
@@ -375,21 +407,93 @@ class Solver(object):
                     # results.append(r_preds)
                     # results.append(r_preds_F)
                     truths.append(r_labels)
+                    if test:
+                        feat_list.append(F_feat.detach().cpu())
 
             avg_loss = total_loss / (self.hp.n_test if test else self.hp.n_valid)
 
+        # =========================
+        # Print inference efficiency metrics
+        # =========================
+            if measure_efficiency and total_infer_batches > 0:
+                 avg_infer_time_per_batch = total_infer_time / total_infer_batches
+                 throughput = total_infer_samples / total_infer_time
+
+                 if torch.cuda.is_available():
+                      peak_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                 else:
+                      peak_memory_gb = 0.0
+
+                 print("========== Inference Efficiency ==========")
+                 print(f"Peak GPU Memory: {peak_memory_gb:.3f} GB")
+                 print(f"Total inference time: {total_infer_time:.6f} s")
+                 print(f"Average inference time per batch: {avg_infer_time_per_batch:.6f} s/batch")
+                 print(f"Throughput: {throughput:.2f} samples/s")
+                 print("==========================================")
+
+
+
+
             results = torch.cat(results)
             truths = torch.cat(truths)
+
 # 在函数最后（return 前）加输出 添加5行
-            avg_infer_time = total_infer_time / num_batches
-            print(f"Average inference time per batch: {avg_infer_time:.6f} seconds")
+          #  avg_infer_time = total_infer_time / num_batches
+           # print(f"Average inference time per batch: {avg_infer_time:.6f} seconds")
             # 如果你想要 per sample（推荐）
-            batch_size = lengths.size(0)
-            print(f"Inference time per sample: {avg_infer_time / batch_size:.6f} seconds")
+         #   batch_size = lengths.size(0)
+         #   print(f"Inference time per sample: {avg_infer_time / batch_size:.6f} seconds")
+
+            #return avg_loss, results, truths
+
+            # if test and len(feat_list) > 0:
+            #     import numpy as np
+            #     import os
+            #
+            #     save_dir = r"H:\why\MSATASE2\tsne_cache"
+            #     os.makedirs(save_dir, exist_ok=True)
+            #
+            #     F_feats = torch.cat(feat_list, dim=0).numpy()
+            #     y_labels = truths.detach().cpu().numpy()
+            #
+            #
+            #
+            #     np.save(os.path.join(save_dir, "DTDCF_F_feat.npy"), F_feats)
+            #     np.save(os.path.join(save_dir, "DTDCF_labels.npy"), y_labels)
+            #
+            #     print("t-SNE features saved to:", save_dir)
+
+            if test and epoch in SAVE_TSNE_EPOCHS and len(feat_list) > 0:
+                  import numpy as np
+                  import os
+
+                  save_dir = r"H:\why\MSATASE2\tsne_epoch_cache"
+                  os.makedirs(save_dir, exist_ok=True)
+
+                  F_feats = torch.cat(feat_list, dim=0).numpy()
+                  y_labels = truths.detach().cpu().numpy()
+
+                  np.save(os.path.join(save_dir, f"F_feat_epoch_{epoch}.npy"), F_feats)
+                  np.save(os.path.join(save_dir, f"labels_epoch_{epoch}.npy"), y_labels)
+
+                  print(f"t-SNE features saved for epoch {epoch} to:", save_dir)
+
+
+
+
+
 
             return avg_loss, results, truths
+
+
+
+
+
+
+
         # 关闭TensorBoard writer
         # writer.close()
+
         best_accu = 1e-8
         best_mae = 1e8
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -398,45 +502,29 @@ class Solver(object):
         with open(log_filename, 'w') as log_file:
             for epoch in range(1, self.hp.num_epochs + 1):
                 start = time.time()
+                dtm_tau = set_dtm_gumbel_temperature(
+                    model,
+                    epoch,
+                    self.hp.num_epochs,
+                    self.hp.dtm_gumbel_tau,
+                    self.hp.dtm_gumbel_tau_min
+                )
+                hard_after = int(getattr(self.hp, "dtm_hard_after_epoch", 0))
+                hard_enabled = bool(getattr(self.hp, "use_dtm_hard_train", 1)) and hard_after > 0 and epoch >= hard_after
+                set_dtm_hard_selection(model, hard_enabled)
+                tau_info = f"DTM Gumbel temperature: {dtm_tau:.4f} | hard_selection: {int(hard_enabled)}\n"
+                log_file.write(tau_info)
+                print(tau_info.strip())
 
                 # minimize all losses left
                 train_loss = train(model, optimizer, scheduler)
 
-                val_loss, _, _ = evaluate(model, test=False)
-                test_loss, results, truths = evaluate(model, test=True)
+                # val_loss, _, _ = evaluate(model, test=False)
+                # test_loss, results, truths = evaluate(model, test=True)
+                val_loss, _, _ = evaluate(model, test=False, epoch=epoch)
+                test_loss, results, truths = evaluate(model, test=True, epoch=epoch)
+
 #可视化触发点
-                # ------------------------------------------------------
-                # 保存 epoch 的特征（IMPORTANT）
-                # ------------------------------------------------------
-                if epoch in [1, 10, 20, 30, 40]:
-                    print(f"\n>>> Extracting features for epoch {epoch} ...")
-
-                    feats = []
-                    labs = []
-
-                    self.model.eval()
-                    with torch.no_grad():
-                        for batch_data in self.test_loader:
-                            visual, vlens, audio, alens, r_labels, c_labels, lengths, bert_sent, bert_sent_mask, ids = batch_data
-
-                            visual = visual.to(self.device)
-                            audio = audio.to(self.device)
-                            bert_sent = bert_sent.to(self.device)
-                            bert_sent_mask = bert_sent_mask.to(self.device)
-
-                            r_preds, r_preds_F, recon_loss, dis_loss, factual_text, counter_text = \
-                                self.model(visual, audio, vlens, alens, bert_sent, bert_sent_mask)
-
-                            feats.append(factual_text.cpu().numpy())
-                            labs.append(r_labels.cpu().numpy())
-
-                    feats = np.concatenate(feats, axis=0)
-                    labs = np.concatenate(labs, axis=0)
-
-                    np.save(f"features_epoch_{epoch}.npy", feats)
-                    np.save(f"labels_epoch_{epoch}.npy", labs)
-                    print(f">>> Saved features_epoch_{epoch}.npy / labels_epoch_{epoch}.npy")
-
                 end = time.time()
                 duration = end - start
                 # scheduler.step(val_loss)
@@ -449,10 +537,13 @@ class Solver(object):
                     accu, mae, res_dict = eval_mosei_senti(results, truths, True)
                 elif self.hp.dataset == 'mosi':
                     accu, mae, res_dict = eval_mosei_senti(results, truths, True)
+
                 print(f'accu: {accu}')
                 print(f'best_accu: {best_accu}')
+
                 print(f'mae: {mae}')
                 print(f'best_mae: {best_mae}')
+
                 if mae <= best_mae:
                     best_mae = mae
                     best_epoch = epoch
@@ -468,6 +559,7 @@ class Solver(object):
                     best_truths = truths
                     print(f"Saved model at pre_trained_models of best_acc/MM.pt!")
                     save_model(self.hp, model, type='acc')
+
 
                 # 将每个epoch的评估结果写入文件
                 if self.hp.dataset in ["mosi", "mosei"]:
